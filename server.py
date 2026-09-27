@@ -11,6 +11,21 @@ DATA_DIR = ROOT / "data"
 RESPONSES_FILE = DATA_DIR / "responses.json"
 PORT = 8000
 
+# Windows 7 registry often maps extensions to wrong MIME types (e.g. .js -> text/plain),
+# so the ones the site needs are set explicitly.
+MIME_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".js": "application/javascript; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".mp4": "video/mp4",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".ico": "image/x-icon",
+}
+
 QUESTION_META = [
     {"key": "q1", "text": "Как часто вы пользуетесь ИИ?", "options": ["Несколько раз в день", "Каждый день", "Несколько раз в неделю", "Несколько раз в месяц", "Редко", "Не пользуюсь"]},
     {"key": "q2", "text": "Для чего вы чаще всего используете ИИ?", "options": ["Поиск информации", "Работа", "Учёба", "Создание текстов", "Генерация идей", "Перевод", "Решение повседневных задач", "Развлечение", "Общение"]},
@@ -112,6 +127,9 @@ class Handler(BaseHTTPRequestHandler):
 
         self._serve_file(file_path)
 
+    def do_HEAD(self):
+        self.do_GET()
+
     def do_POST(self):
         parsed = urlparse(self.path)
         path = unquote(parsed.path)
@@ -154,18 +172,57 @@ class Handler(BaseHTTPRequestHandler):
         return None
 
     def _serve_file(self, file_path: Path):
-        mime_type, encoding = mimetypes.guess_type(str(file_path))
+        mime_type = MIME_TYPES.get(file_path.suffix.lower())
         if mime_type is None:
-            mime_type = "application/octet-stream"
+            mime_type = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
 
-        data = file_path.read_bytes()
-        self.send_response(200)
+        size = file_path.stat().st_size
+        start, end = 0, size - 1
+        status = 200
+        range_header = self.headers.get("Range", "")
+        if range_header.startswith("bytes=") and size > 0:
+            first, _, last = range_header[6:].split(",")[0].strip().partition("-")
+            try:
+                if first:
+                    start = int(first)
+                    if last:
+                        end = min(int(last), size - 1)
+                elif last:
+                    start = max(size - int(last), 0)
+                if start > end:
+                    raise ValueError
+                status = 206
+            except ValueError:
+                self.send_response(416)
+                self.send_header("Content-Range", "bytes */%d" % size)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+
+        length = end - start + 1 if size else 0
+        self.send_response(status)
         self.send_header("Content-Type", mime_type)
-        self.send_header("Content-Length", str(len(data)))
-        if encoding:
-            self.send_header("Content-Encoding", encoding)
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(length))
+        if status == 206:
+            self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
         self.end_headers()
-        self.wfile.write(data)
+        if self.command == "HEAD":
+            return
+
+        # Stream in chunks so large videos are not loaded into memory at once.
+        try:
+            with file_path.open("rb") as f:
+                f.seek(start)
+                remaining = length
+                while remaining > 0:
+                    chunk = f.read(min(64 * 1024, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+            pass
 
     def _send_json(self, status_code, payload):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -173,12 +230,18 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        if self.command != "HEAD":
+            self.wfile.write(body)
 
 
 def main():
     ensure_data_file()
-    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    try:
+        server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    except OSError as exc:
+        print("Cannot start server on port %d: %s" % (PORT, exc))
+        print("Probably the server is already running.")
+        return
     print(f"Python server running on http://localhost:{PORT}")
     try:
         server.serve_forever()

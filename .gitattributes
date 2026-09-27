@@ -1,0 +1,4 @@
+*.bat text eol=crlf
+*.url text eol=crlf
+*.mp4 binary
+*.exe binary
